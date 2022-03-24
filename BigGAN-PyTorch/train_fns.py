@@ -98,15 +98,15 @@ def GAN_training_function(G, D, GD, z_, y_, ema, state_dict, config):
                               x[counter], y[counter], train_G=True, 
                               split_D=config['split_D'], fD=fD)
             
-            D_aux_loss = torch.tensor(0., device=D_loss.device)
+            D_dual_aux_loss = torch.tensor(0., device=D_loss.device)
             if config['loss'] == 'acgan':
-              D_aux_loss += losses.classifier_loss_dis(D_ac_fake2, y_[:config['batch_size']], config['hinge'])
+              D_dual_aux_loss += losses.classifier_loss_dis(D_ac_fake2, y_[:config['batch_size']], config['hinge'])
             elif config['loss'] == 'tacgan':
-              D_aux_loss += losses.classifier_loss_dis(D_ac_fake2, y_[:config['batch_size']], config['hinge']) 
+              D_dual_aux_loss += losses.classifier_loss_dis(D_ac_fake2, y_[:config['batch_size']], config['hinge']) 
             elif config['loss'] == 'adcgan':
-              D_aux_loss += losses.classifier_loss_dis(D_adc_real2, y[counter] * 2 + 1, config['hinge'])
-              D_aux_loss += losses.classifier_loss_dis(D_adc_fake2, y_[:config['batch_size']] * 2, config['hinge'])
-            D_aux_loss = config['D_lambda'] * D_aux_loss / float(config['num_D_accumulations'])
+              D_dual_aux_loss += losses.classifier_loss_dis(D_adc_real2, y[counter] * 2 + 1, config['hinge'])
+              D_dual_aux_loss += losses.classifier_loss_dis(D_adc_fake2, y_[:config['batch_size']] * 2, config['hinge'])
+            D_dual_aux_loss = config['D_lambda'] * D_dual_aux_loss / float(config['num_D_accumulations'])
             
             counter += 1
             
@@ -116,7 +116,7 @@ def GAN_training_function(G, D, GD, z_, y_, ema, state_dict, config):
             print('using modified ortho reg in D')
             utils.ortho(fD, config['D_ortho'])
           
-          df_optim.step(D_aux_loss)
+          df_optim.step(D_dual_aux_loss)
         
         counter = 0
       

@@ -8,6 +8,7 @@ import os
 
 import utils
 import losses
+import higher
 
 
 # Dummy training function for debugging
@@ -37,7 +38,15 @@ def GAN_training_function(G, D, GD, z_, y_, ema, state_dict, config):
       for accumulation_index in range(config['num_D_accumulations']):
         z_.sample_()
         y_.sample_()
-        (D_fake, D_real), (D_adc_fake, D_adc_real), (D_ac_fake, D_ac_real), (D_mi_fake, D_mi_real) = GD(z_[:config['batch_size']], y_[:config['batch_size']], 
+        if config['apply_dual']:
+          (D_fake, D_real), (D_fake2, D_real2), \
+            (D_adc_fake, D_adc_real), (D_adc_fake2, D_adc_real2), \
+              (D_ac_fake, D_ac_real), (D_ac_fake2, D_ac_real2), \
+                (D_mi_fake, D_mi_real), (D_mi_fake2, D_mi_real2) = GD(z_[:config['batch_size']], y_[:config['batch_size']], 
+                            x[counter], y[counter], train_G=False, 
+                            split_D=config['split_D'])
+        else:
+          (D_fake, D_real), (D_adc_fake, D_adc_real), (D_ac_fake, D_ac_real), (D_mi_fake, D_mi_real) = GD(z_[:config['batch_size']], y_[:config['batch_size']], 
                             x[counter], y[counter], train_G=False, 
                             split_D=config['split_D'])
          
@@ -45,19 +54,23 @@ def GAN_training_function(G, D, GD, z_, y_, ema, state_dict, config):
         # the number of gradient accumulations
         D_loss_real, D_loss_fake = losses.discriminator_loss(D_fake, D_real)
         D_loss = (D_loss_real + D_loss_fake) / float(config['num_D_accumulations'])
-        
-        D_aux_loss = torch.tensor(0, device=D_loss.device)
+
+        D_aux_loss = torch.tensor(0., device=D_loss.device)
         if config['loss'] == 'acgan':
-          D_ac_loss = losses.classifier_loss_dis(D_ac_real, y[counter], config['hinge'])
-          D_aux_loss = D_ac_loss
+          D_aux_loss += losses.classifier_loss_dis(D_ac_real, y[counter], config['hinge'])
+          if config['apply_dual']:
+            D_aux_loss += losses.classifier_loss_dis(D_ac_fake2, y_[:config['batch_size']], config['hinge'])
         elif config['loss'] == 'tacgan':
-          D_ac_loss = losses.classifier_loss_dis(D_ac_real, y[counter], config['hinge']) 
-          D_mi_loss = losses.classifier_loss_dis(D_mi_fake, y_[:config['batch_size']], config['hinge'])
-          D_aux_loss = D_ac_loss + D_mi_loss
+          D_aux_loss += losses.classifier_loss_dis(D_ac_real, y[counter], config['hinge']) 
+          D_aux_loss += losses.classifier_loss_dis(D_mi_fake, y_[:config['batch_size']], config['hinge'])
+          if config['apply_dual']:
+            D_aux_loss += losses.classifier_loss_dis(D_ac_fake2, y_[:config['batch_size']], config['hinge']) 
         elif config['loss'] == 'adcgan':
-          D_adc_loss_real = losses.classifier_loss_dis(D_adc_real, y[counter] * 2, config['hinge'])
-          D_adc_loss_fake = losses.classifier_loss_dis(D_adc_fake, y_[:config['batch_size']] * 2 + 1, config['hinge'])
-          D_aux_loss = D_adc_loss_real + D_adc_loss_fake
+          D_aux_loss += losses.classifier_loss_dis(D_adc_real, y[counter] * 2, config['hinge'])
+          D_aux_loss += losses.classifier_loss_dis(D_adc_fake, y_[:config['batch_size']] * 2 + 1, config['hinge'])
+          if config['apply_dual']:
+            D_aux_loss += losses.classifier_loss_dis(D_adc_real2, y[counter] * 2 + 1, config['hinge'])
+            D_aux_loss += losses.classifier_loss_dis(D_adc_fake2, y_[:config['batch_size']] * 2, config['hinge'])
         D_aux_loss = config['D_lambda'] * D_aux_loss / float(config['num_D_accumulations'])
         
         (D_loss + D_aux_loss).backward()
@@ -71,44 +84,127 @@ def GAN_training_function(G, D, GD, z_, y_, ema, state_dict, config):
       
       D.optim.step()
     
-    # Optionally toggle "requires_grad"
-    if config['toggle_grads']:
-      utils.toggle_grad(D, False)
-      utils.toggle_grad(G, True)
+    if config['apply_dual']:
+      with higher.innerloop_ctx(D, D.optim) as (fD, df_optim):
+        counter = 0
+        for step_index in range(config['num_D_unrolled_steps']):
+          for accumulation_index in range(config['num_D_accumulations']):
+            z_.sample_()
+            y_.sample_()
+            (D_fake, D_real), (D_fake2, D_real2), \
+              (D_adc_fake, D_adc_real), (D_adc_fake2, D_adc_real2), \
+                (D_ac_fake, D_ac_real), (D_ac_fake2, D_ac_real2), \
+                  (D_mi_fake, D_mi_real), (D_mi_fake2, D_mi_real2) = GD(z_[:config['batch_size']], y_[:config['batch_size']], 
+                              x[counter], y[counter], train_G=True, 
+                              split_D=config['split_D'], fD=fD)
+            
+            D_aux_loss = torch.tensor(0., device=D_loss.device)
+            if config['loss'] == 'acgan':
+              D_aux_loss += losses.classifier_loss_dis(D_ac_fake2, y_[:config['batch_size']], config['hinge'])
+            elif config['loss'] == 'tacgan':
+              D_aux_loss += losses.classifier_loss_dis(D_ac_fake2, y_[:config['batch_size']], config['hinge']) 
+            elif config['loss'] == 'adcgan':
+              D_aux_loss += losses.classifier_loss_dis(D_adc_real2, y[counter] * 2 + 1, config['hinge'])
+              D_aux_loss += losses.classifier_loss_dis(D_adc_fake2, y_[:config['batch_size']] * 2, config['hinge'])
+            D_aux_loss = config['D_lambda'] * D_aux_loss / float(config['num_D_accumulations'])
+            
+            counter += 1
+            
+          # Optionally apply ortho reg in D
+          if config['D_ortho'] > 0.0:
+            # Debug print to indicate we're using ortho reg in D.
+            print('using modified ortho reg in D')
+            utils.ortho(fD, config['D_ortho'])
+          
+          df_optim.step(D_aux_loss)
+        
+        counter = 0
       
-    # Zero G's gradients by default before training G, for safety
-    G.optim.zero_grad()
-    
-    # If accumulating gradients, loop multiple times
-    for accumulation_index in range(config['num_G_accumulations']):    
-      z_.sample_()
-      y_.sample_()
-      D_fake, D_adc_fake, D_ac_fake, D_mi_fake = GD(z_, y_, train_G=True, split_D=config['split_D'])
-      G_loss = losses.generator_loss(D_fake) / float(config['num_G_accumulations'])
+        # Optionally toggle "requires_grad"
+        if config['toggle_grads']:
+          utils.toggle_grad(D, False)
+          utils.toggle_grad(G, True)
+          
+        # Zero G's gradients by default before training G, for safety
+        G.optim.zero_grad()
+        
+        # If accumulating gradients, loop multiple times
+        for accumulation_index in range(config['num_G_accumulations']):    
+          z_.sample_()
+          y_.sample_()
+          
+          (_, _), (D_fake2, D_real2), \
+            (_, _), (D_adc_fake2, D_adc_real2), \
+              (_, _), (D_ac_fake2, D_ac_real2), \
+                (_, _), (D_mi_fake2, D_mi_real2) = GD(z_[:config['batch_size']], y_[:config['batch_size']], 
+                            x[counter], y[counter], train_G=True, 
+                            split_D=config['split_D'], fD=fD)
+          D_fake, _, D_adc_fake, _, D_ac_fake, _, D_mi_fake, _ = GD(z_, y_, train_G=True, split_D=config['split_D'])
+          G_loss = losses.generator_loss(D_fake) / float(config['num_G_accumulations'])
 
-      G_aux_loss = torch.tensor(0., device=G_loss.device)
-      if config['loss'] == 'acgan':
-        G_ac_loss = losses.classifier_loss_gen(D_ac_fake, y_, config['hinge'])
-        G_aux_loss = G_ac_loss
-      elif config['loss'] == 'tacgan':
-        G_ac_loss = losses.classifier_loss_gen(D_ac_fake, y_, config['hinge']) 
-        G_mi_loss = losses.classifier_loss_gen(D_mi_fake, y_, config['hinge'])
-        G_aux_loss = G_ac_loss - G_mi_loss
-      elif config['loss'] == 'adcgan':
-        G_adc_loss_pos = losses.classifier_loss_gen(D_adc_fake, y_ * 2, config['hinge'])
-        G_adc_loss_neg = losses.classifier_loss_gen(D_adc_fake, y_ * 2 + 1, config['hinge'])
-        G_aux_loss = G_adc_loss_pos - G_adc_loss_neg
-      G_aux_loss = config['G_lambda'] * G_aux_loss / float(config['num_G_accumulations'])
+          G_aux_loss = torch.tensor(0., device=G_loss.device)
+          if config['loss'] == 'acgan':
+            G_aux_loss += losses.classifier_loss_gen(D_ac_fake, y_, config['hinge'])
+            G_aux_loss += losses.classifier_loss_gen(D_ac_real2, y[counter], config['hinge'])
+          elif config['loss'] == 'tacgan':
+            G_aux_loss += losses.classifier_loss_gen(D_ac_fake, y_, config['hinge']) 
+            G_aux_loss += losses.classifier_loss_gen(D_mi_fake, y_, config['hinge'])
+            G_aux_loss += losses.classifier_loss_gen(D_ac_real2, y[counter], config['hinge']) 
+          elif config['loss'] == 'adcgan':
+            G_aux_loss += losses.classifier_loss_gen(D_adc_fake, y_ * 2, config['hinge'])
+            G_aux_loss -= losses.classifier_loss_gen(D_adc_fake, y_ * 2 + 1, config['hinge'])
+            G_aux_loss += losses.classifier_loss_gen(D_adc_real2, y[counter] * 2, config['hinge'])
+            G_aux_loss -= losses.classifier_loss_gen(D_adc_real2, y[counter] * 2 + 1, config['hinge'])
+          G_aux_loss = config['G_lambda'] * G_aux_loss / float(config['num_G_accumulations'])
+          
+          (G_loss.detach() + G_aux_loss).backward()
+        
+        # Optionally apply modified ortho reg in G
+        if config['G_ortho'] > 0.0:
+          print('using modified ortho reg in G') # Debug print to indicate we're using ortho reg in G
+          # Don't ortho reg shared, it makes no sense. Really we should blacklist any embeddings for this
+          utils.ortho(G, config['G_ortho'], 
+                      blacklist=[param for param in G.shared.parameters()])
+        G.optim.step()
+    else:
+      # Optionally toggle "requires_grad"
+      if config['toggle_grads']:
+        utils.toggle_grad(D, False)
+        utils.toggle_grad(G, True)
+        
+      # Zero G's gradients by default before training G, for safety
+      G.optim.zero_grad()
       
-      (G_loss + G_aux_loss).backward()
-    
-    # Optionally apply modified ortho reg in G
-    if config['G_ortho'] > 0.0:
-      print('using modified ortho reg in G') # Debug print to indicate we're using ortho reg in G
-      # Don't ortho reg shared, it makes no sense. Really we should blacklist any embeddings for this
-      utils.ortho(G, config['G_ortho'], 
-                  blacklist=[param for param in G.shared.parameters()])
-    G.optim.step()
+      # If accumulating gradients, loop multiple times
+      for accumulation_index in range(config['num_G_accumulations']):    
+        z_.sample_()
+        y_.sample_()
+        D_fake, D_adc_fake, D_ac_fake, D_mi_fake = GD(z_, y_, train_G=True, split_D=config['split_D'])
+        G_loss = losses.generator_loss(D_fake) / float(config['num_G_accumulations'])
+
+        G_aux_loss = torch.tensor(0., device=G_loss.device)
+        if config['loss'] == 'acgan':
+          G_ac_loss = losses.classifier_loss_gen(D_ac_fake, y_, config['hinge'])
+          G_aux_loss = G_ac_loss
+        elif config['loss'] == 'tacgan':
+          G_ac_loss = losses.classifier_loss_gen(D_ac_fake, y_, config['hinge']) 
+          G_mi_loss = losses.classifier_loss_gen(D_mi_fake, y_, config['hinge'])
+          G_aux_loss = G_ac_loss - G_mi_loss
+        elif config['loss'] == 'adcgan':
+          G_adc_loss_pos = losses.classifier_loss_gen(D_adc_fake, y_ * 2, config['hinge'])
+          G_adc_loss_neg = losses.classifier_loss_gen(D_adc_fake, y_ * 2 + 1, config['hinge'])
+          G_aux_loss = G_adc_loss_pos - G_adc_loss_neg
+        G_aux_loss = config['G_lambda'] * G_aux_loss / float(config['num_G_accumulations'])
+        
+        (G_loss + G_aux_loss).backward()
+      
+      # Optionally apply modified ortho reg in G
+      if config['G_ortho'] > 0.0:
+        print('using modified ortho reg in G') # Debug print to indicate we're using ortho reg in G
+        # Don't ortho reg shared, it makes no sense. Really we should blacklist any embeddings for this
+        utils.ortho(G, config['G_ortho'], 
+                    blacklist=[param for param in G.shared.parameters()])
+      G.optim.step()
     
     # If we have an ema, update it, regardless of if we test with it or not
     if config['ema']:

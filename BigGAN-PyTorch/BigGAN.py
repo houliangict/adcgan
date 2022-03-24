@@ -287,7 +287,7 @@ class Discriminator(nn.Module):
                num_D_SVs=1, num_D_SV_itrs=1, D_activation=nn.ReLU(inplace=False),
                D_lr=2e-4, D_B1=0.0, D_B2=0.999, adam_eps=1e-8,
                SN_eps=1e-12, output_dim=1, D_mixed_precision=False, D_fp16=False,
-               D_init='ortho', skip_init=False, D_param='SN', projection=False, **kwargs):
+               D_init='ortho', skip_init=False, D_param='SN', projection=False, apply_dual=False, **kwargs):
     super(Discriminator, self).__init__()
     # Width multiplier
     self.ch = D_ch
@@ -315,6 +315,8 @@ class Discriminator(nn.Module):
     self.arch = D_arch(self.ch, self.attention)[resolution]
     # Projection head?
     self.projection = projection
+    # Apply dual adversarial training?
+    self.apply_dual = apply_dual
 
     # Which convs, batchnorms, and linear layers to use
     # No option to turn off SN in D right now
@@ -354,6 +356,11 @@ class Discriminator(nn.Module):
     self.adc = self.which_linear(self.arch['out_channels'][-1], n_classes * 2)
     self.ac = self.which_linear(self.arch['out_channels'][-1], n_classes)
     self.mi = self.which_linear(self.arch['out_channels'][-1], n_classes)
+    if self.apply_dual:
+      self.linear_dual = self.which_linear(self.arch['out_channels'][-1], output_dim)
+      self.adc_dual = self.which_linear(self.arch['out_channels'][-1], n_classes * 2)
+      self.ac_dual = self.which_linear(self.arch['out_channels'][-1], n_classes)
+      self.mi_dual = self.which_linear(self.arch['out_channels'][-1], n_classes)
     # Embedding for projection discrimination
     self.embed = self.which_embedding(self.n_classes, self.arch['out_channels'][-1])
 
@@ -407,9 +414,18 @@ class Discriminator(nn.Module):
     adc = self.adc(h)
     ac = self.ac(h)
     mi = self.mi(h)
+    if self.apply_dual:
+      out_dual = self.linear_dual(h)
+      adc_dual = self.adc_dual(h)
+      ac_dual = self.ac_dual(h)
+      mi_dual = self.mi_dual(h)
     # Get projection of final featureset onto class vectors and add to evidence
     if self.projection:
       out = out + torch.sum(self.embed(y) * h, 1, keepdim=True)
+      if self.apply_dual:
+        out_dual = out_dual + torch.sum(self.embed(y) * h, 1, keepdim=True)
+    if self.apply_dual:
+      return out, out_dual, adc, adc_dual, ac, ac_dual, mi, mi_dual
     return out, adc, ac, mi
 
 # Parallelized G_D to minimize cross-gpu communication
@@ -421,7 +437,9 @@ class G_D(nn.Module):
     self.D = D
 
   def forward(self, z, gy, x=None, dy=None, train_G=False, return_G_z=False,
-              split_D=False):              
+              split_D=False, fD=None):              
+    if not fD:
+      fD = self.D
     # If training G, enable grad tape
     with torch.set_grad_enabled(train_G):
       # Get Generator output given noise
@@ -434,9 +452,9 @@ class G_D(nn.Module):
     # Split_D means to run D once with real data and once with fake,
     # rather than concatenating along the batch dimension.
     if split_D:
-      D_fake = self.D(G_z, gy)
+      D_fake = fD(G_z, gy)
       if x is not None:
-        D_real = self.D(x, dy)
+        D_real = fD(x, dy)
         return D_fake, D_real
       else:
         if return_G_z:
@@ -449,11 +467,21 @@ class G_D(nn.Module):
       D_input = torch.cat([G_z, x], 0) if x is not None else G_z
       D_class = torch.cat([gy, dy], 0) if dy is not None else gy
       # Get Discriminator output
-      D_out, D_adc, D_ac, D_mi = self.D(D_input, D_class)
+      if self.D.apply_dual:
+        D_out, D_out_dual, D_adc, D_adc_dual, D_ac, D_ac_dual, D_mi, D_mi_dual = fD(D_input, D_class)
+      else:
+        D_out, D_adc, D_ac, D_mi = fD(D_input, D_class)
       if x is not None:
+        if self.D.apply_dual:
+          return torch.split(D_out, [G_z.shape[0], x.shape[0]]), torch.split(D_out_dual, [G_z.shape[0], x.shape[0]]), \
+                 torch.split(D_adc, [G_z.shape[0], x.shape[0]]), torch.split(D_adc_dual, [G_z.shape[0], x.shape[0]]), \
+                 torch.split(D_ac, [G_z.shape[0], x.shape[0]]), torch.split(D_ac_dual, [G_z.shape[0], x.shape[0]]), \
+                 torch.split(D_mi, [G_z.shape[0], x.shape[0]]), torch.split(D_mi_dual, [G_z.shape[0], x.shape[0]]) 
         return torch.split(D_out, [G_z.shape[0], x.shape[0]]), torch.split(D_adc, [G_z.shape[0], x.shape[0]]), torch.split(D_ac, [G_z.shape[0], x.shape[0]]), torch.split(D_mi, [G_z.shape[0], x.shape[0]]) # D_fake, D_real
       else:
         if return_G_z:
           return D_out, D_adc, D_ac, D_mi, G_z
         else:
+          if self.D.apply_dual:
+            return D_out, D_out_dual, D_adc, D_adc_dual, D_ac, D_ac_dual, D_mi, D_mi_dual
           return D_out, D_adc, D_ac, D_mi

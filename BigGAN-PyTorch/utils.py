@@ -339,6 +339,14 @@ def prepare_parser():
   parser.add_argument(
     '--D_lambda', type=float, default=1.0,
     help='Classification task lambda coefficient for D (default: %(default)s)')
+
+  ### Dual training stuff ###
+  parser.add_argument(
+    '--apply_dual', action='store_true', default=False,
+    help='Wether to apply dual trianing for cGANs')
+  parser.add_argument(
+    '--num_D_unrolled_steps', type=int, default=1,
+    help='Number of D unrolled steps per G step (default: %(default)s)')
   
   ### Which train function ###
   parser.add_argument(

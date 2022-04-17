@@ -88,6 +88,7 @@ def GAN_training_function(G, D, GD, z_, y_, ema, state_dict, config):
       with higher.innerloop_ctx(D, D.optim) as (fD, df_optim):
         counter = 0
         for step_index in range(config['num_D_unrolled_steps']):
+          D_dual_aux_loss_total = torch.tensor(0., device=D_loss.device)
           for accumulation_index in range(config['num_D_accumulations']):
             z_.sample_()
             y_.sample_()
@@ -107,6 +108,7 @@ def GAN_training_function(G, D, GD, z_, y_, ema, state_dict, config):
               D_dual_aux_loss += losses.classifier_loss_dis(D_adc_real2, y[counter] * 2 + 1, config['hinge'])
               D_dual_aux_loss += losses.classifier_loss_dis(D_adc_fake2, y_[:config['batch_size']] * 2, config['hinge'])
             D_dual_aux_loss = config['D_lambda'] * D_dual_aux_loss / float(config['num_D_accumulations'])
+            D_dual_aux_loss_total += D_dual_aux_loss
             
             counter += 1
             
@@ -116,7 +118,7 @@ def GAN_training_function(G, D, GD, z_, y_, ema, state_dict, config):
             print('using modified ortho reg in D')
             utils.ortho(fD, config['D_ortho'])
           
-          df_optim.step(D_dual_aux_loss)
+          df_optim.step(D_dual_aux_loss_total)
         
         counter = 0
       

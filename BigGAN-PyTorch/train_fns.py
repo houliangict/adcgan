@@ -11,6 +11,11 @@ import losses
 import higher
 
 
+def freeze(discriminator):
+  for name, param in discriminator.named_parameters():
+    if 'dual' not in name:
+      param.requires_grad = False
+
 # Dummy training function for debugging
 def dummy_training_function():
   def train(x, y):
@@ -86,6 +91,7 @@ def GAN_training_function(G, D, GD, z_, y_, ema, state_dict, config):
     
     if config['apply_dual']:
       with higher.innerloop_ctx(D, D.optim) as (fD, df_optim):
+        freeze(fD)
         counter = 0
         for step_index in range(config['num_D_unrolled_steps']):
           D_dual_aux_loss_total = torch.tensor(0., device=D_loss.device)
